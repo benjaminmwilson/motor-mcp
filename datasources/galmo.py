@@ -1,9 +1,15 @@
 """Galaxy Motors (galmo) datasource — Convertus VMS API via WordPress proxy."""
 
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
+
+
+@dataclass
+class GalmoExtras:
+    pass
 
 INVENTORY_ID = "2767"
 PROXY_URL = "https://www.galaxymotors.net/wp-content/plugins/convertus-vms/include/php/ajax-vehicles.php"
@@ -48,6 +54,7 @@ async def search_inventory(
     year_max: Optional[int],
     page: int = 1,
     per_page: int = 25,
+    extras: GalmoExtras = GalmoExtras(),
 ) -> dict:
     url = build_api_url(make, model, year_min, year_max, page, per_page)
     async with AsyncSession(impersonate="chrome131") as client:
