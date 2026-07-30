@@ -11,6 +11,7 @@ from curl_cffi.requests import AsyncSession
 BASE_URL = "https://www.autotrader.ca"
 GRAPHQL_URL = f"{BASE_URL}/listing-search-api/graphql"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 
 DEFAULT_POSTAL_CODE = "M5H2N2"  # Toronto financial district
 
@@ -21,7 +22,9 @@ _AUTH_B64_PREFIX = "YXMyNC1zZWFyY2gtZnVubmVs"
 _cached_auth = "Basic YXMyNC1zZWFyY2gtZnVubmVsOnZucmZiYkJqSTMyT2wxV2thNnVOSFJwM0VZbjRkag=="
 
 _geocode_cache: dict[str, tuple[float, float, str]] = {}
-_taxonomy_cache: dict[str, Optional[str]] = {}
+_reverse_geocode_cache: dict[str, tuple[str, str]] = {}
+# Keyed by "make|model" (lowercased) → (make_id, model_id)
+_id_cache: dict[str, tuple[Optional[int], Optional[int]]] = {}
 
 _PROVINCE_ABBR: dict[str, str] = {
     "A": "NL", "B": "NS", "C": "PE", "E": "NB",
@@ -51,7 +54,19 @@ _PROVINCE_DEFAULTS: dict[str, tuple[float, float, str]] = {
 class AutotraderExtras:
     postal_code: str = field(
         default=DEFAULT_POSTAL_CODE,
-        metadata={"description": "Canadian postal code for proximity sorting (e.g. 'V9C3M3'). Defaults to Toronto."},
+        metadata={"description": "Canadian postal code for proximity sorting (e.g. 'V9C3M3'). Defaults to Toronto. Ignored if latitude/longitude are provided."},
+    )
+    latitude: Optional[float] = field(
+        default=None,
+        metadata={"description": "Latitude for proximity sorting, used instead of postal_code (e.g. 49.2827). Must be given together with longitude."},
+    )
+    longitude: Optional[float] = field(
+        default=None,
+        metadata={"description": "Longitude for proximity sorting, used instead of postal_code (e.g. -123.1207). Must be given together with latitude."},
+    )
+    odometer_max_km: Optional[int] = field(
+        default=None,
+        metadata={"description": "Maximum odometer reading in km (e.g. 150000). Optional."},
     )
 
 
@@ -106,25 +121,62 @@ async def _geocode(postal_code: str) -> tuple[float, float, str]:
     return default
 
 
-async def _resolve_cat(make: Optional[str], model: Optional[str]) -> Optional[str]:
-    """
-    Resolve make/model names to a taxonomy identifier via getFreeTextTaxonomyV2.
+async def _reverse_geocode(lat: float, lon: float) -> tuple[str, str]:
+    """Convert (lat, lon) to (postal_code, city) via Nominatim reverse geocoding."""
+    key = f"{lat:.4f},{lon:.4f}"
+    if key in _reverse_geocode_cache:
+        return _reverse_geocode_cache[key]
 
-    Returns:
-      - "ma31gr200622"  (cat code) when make+model → used as cat=... in queryString
-      - "31|||"         (mmmv string) when make-only → used as mmmv=... in queryString
-      - None            when make is absent or lookup fails
+    result = ("", "")
+    try:
+        async with AsyncSession(impersonate="chrome131") as session:
+            resp = await session.get(
+                NOMINATIM_REVERSE_URL,
+                params={"lat": str(lat), "lon": str(lon), "format": "json", "addressdetails": "1"},
+                headers={"User-Agent": "motor-mcp/1.0"},
+            )
+            addr = (resp.json() or {}).get("address", {})
+            postal_code = (addr.get("postcode") or "").upper().replace(" ", "")
+            city = addr.get("city") or addr.get("town") or addr.get("village") or ""
+            result = (postal_code, city)
+    except Exception:
+        pass
+
+    _reverse_geocode_cache[key] = result
+    return result
+
+
+_SAMPLE_GQL = """
+query SampleListing($qs: String!, $locale: Locale_) {
+  search {
+    listingsByQueryString(queryString: $qs, locale: $locale) {
+      listings { details { vehicle { classification { model { raw } } } } }
+    }
+  }
+}
+"""
+
+
+async def _resolve_ids(make: Optional[str], model: Optional[str]) -> tuple[Optional[int], Optional[int]]:
+    """
+    Resolve make/model names to structured API integer IDs.
+
+    Returns (make_id, model_id) where:
+      make_id:  classification.make int (e.g. 31 for Honda)
+      model_id: classification.model int (e.g. 1775 for Civic), None for make-only searches
+      (None, None) when make is absent or lookup fails
     """
     if not make:
-        return None
+        return None, None
 
     cache_key = f"{make.lower()}|{(model or '').lower()}"
-    if cache_key in _taxonomy_cache:
-        return _taxonomy_cache[cache_key]
+    if cache_key in _id_cache:
+        return _id_cache[cache_key]
 
     search_term = make + (" " + model if model else "")
     try:
         async with AsyncSession(impersonate="chrome131") as session:
+            # Step 1: resolve text → cat code via taxonomy
             resp = await session.post(
                 GRAPHQL_URL,
                 json={
@@ -132,40 +184,72 @@ async def _resolve_cat(make: Optional[str], model: Optional[str]) -> Optional[st
                     "query": """
                     query ResolveCat($term: String!) {
                       getFreeTextTaxonomyV2(searchTerm: $term) {
-                        items { cat displayName }
+                        items { cat }
                       }
                     }
                     """,
                     "variables": {"term": search_term},
                 },
-                headers={
-                    "Authorization": _cached_auth,
-                    "x-culture": "en-CA",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": _cached_auth, "x-culture": "en-CA", "Content-Type": "application/json"},
             )
             items = (resp.json().get("data") or {}).get("getFreeTextTaxonomyV2", {}).get("items") or []
-            if items:
-                cat = items[0]["cat"]
-                if model:
-                    result: Optional[str] = cat
-                else:
-                    # make-only: extract the numeric make ID from the cat code
-                    m = re.search(r"ma(\d+)", cat)
-                    result = f"{m.group(1)}|||" if m else None
-                _taxonomy_cache[cache_key] = result
-                return result
+            if not items:
+                _id_cache[cache_key] = (None, None)
+                return None, None
+
+            cat = items[0]["cat"]
+            m = re.search(r"ma(\d+)", cat)
+            if not m:
+                _id_cache[cache_key] = (None, None)
+                return None, None
+            make_id = int(m.group(1))
+
+            if not model:
+                _id_cache[cache_key] = (make_id, None)
+                return make_id, None
+
+            # Step 2: fetch one sample listing to get the structured API's model.raw ID.
+            # The cat code from getFreeTextTaxonomyV2 uses Autotrader CA's internal group ID
+            # (e.g. gr200622 for Civic) which does NOT map to the structured listings API's
+            # classification.model field. We resolve it by fetching one listing.
+            zip_str = quote("M5H2N2 Toronto, ON", safe="")
+            qs = f"cat={cat}&zip={zip_str}&lat=43.6488&lon=-79.3844&zipr=100&cy=CA&atype=C&pg=1&size=1"
+            resp2 = await session.post(
+                GRAPHQL_URL,
+                json={
+                    "operationName": "SampleListing",
+                    "query": _SAMPLE_GQL,
+                    "variables": {"qs": qs, "locale": "en_CA"},
+                },
+                headers={"Authorization": _cached_auth, "x-culture": "en-CA", "Content-Type": "application/json"},
+            )
+            listings = (
+                (resp2.json().get("data") or {})
+                .get("search", {})
+                .get("listingsByQueryString", {})
+                .get("listings") or []
+            )
+            if listings:
+                model_raw = (
+                    (listings[0]["details"]["vehicle"]["classification"].get("model") or {}).get("raw")
+                )
+                model_id: Optional[int] = int(model_raw) if model_raw is not None else None
+            else:
+                model_id = None
+
+            _id_cache[cache_key] = (make_id, model_id)
+            return make_id, model_id
     except Exception:
         pass
 
-    _taxonomy_cache[cache_key] = None
-    return None
+    _id_cache[cache_key] = (None, None)
+    return None, None
 
 
 _SEARCH_GQL = """
-query SearchListings($qs: String!, $locale: Locale_) {
+query StructuredListings($vehicle: Vehicle_, $location: Location_, $metadata: Metadata_, $locale: Locale_) {
   search {
-    listingsByQueryString(queryString: $qs, locale: $locale) {
+    listings(vehicle: $vehicle, location: $location, metadata: $metadata, locale: $locale) {
       metadata { currentPage pageSize totalItems totalPages }
       listings {
         id
@@ -197,49 +281,11 @@ query SearchListings($qs: String!, $locale: Locale_) {
 # amountInEUR is the AS24 internal price field name; for Canadian listings it returns CAD.
 
 
-def _build_qs(
-    cat: Optional[str],
-    year_min: Optional[int],
-    year_max: Optional[int],
-    lat: float,
-    lon: float,
-    postal_code: str,
-    city: str,
-    province_abbr: str,
-    page: int,
-    per_page: int,
-) -> str:
-    parts = []
-    if cat:
-        # mmmv strings contain "|" (e.g. "31|||"); cat codes do not (e.g. "ma31gr200622")
-        parts.append(f"mmmv={cat}" if "|" in cat else f"cat={cat}")
-    if year_min or year_max:
-        lo = year_min or 1900
-        hi = year_max or year_min
-        parts.append(f"yr={lo}-{hi}")
-    zip_str = quote(f"{postal_code} {city}, {province_abbr}", safe="")
-    parts += [
-        f"zip={zip_str}", f"lat={lat:.6f}", f"lon={lon:.6f}", "zipr=100",
-        "offer=U", "cy=CA", "damaged_listing=exclude", "atype=C",
-        "sort=standard", "desc=0", f"pg={page}", f"size={per_page}",
-    ]
-    return "&".join(parts)
-
-
-async def _do_gql(session: AsyncSession, qs: str, auth: str):
+async def _do_structured(session: AsyncSession, vars_: dict, auth: str):
     return await session.post(
         GRAPHQL_URL,
-        json={
-            "operationName": "SearchListings",
-            "query": _SEARCH_GQL,
-            "variables": {"qs": qs, "locale": "en_CA"},
-        },
-        headers={
-            "Authorization": auth,
-            "x-culture": "en-CA",
-            "culture": "en-CA",
-            "Content-Type": "application/json",
-        },
+        json={"operationName": "StructuredListings", "query": _SEARCH_GQL, "variables": vars_},
+        headers={"Authorization": auth, "x-culture": "en-CA", "Content-Type": "application/json"},
     )
 
 
@@ -254,32 +300,75 @@ async def search_inventory(
 ) -> dict:
     global _cached_auth
 
-    postal_code = (extras.postal_code or DEFAULT_POSTAL_CODE).upper().replace(" ", "")
+    if (extras.latitude is None) != (extras.longitude is None):
+        raise ValueError("latitude and longitude must be provided together")
+
+    if extras.latitude is not None and extras.longitude is not None:
+        lat, lon = extras.latitude, extras.longitude
+        # Reverse-geocode and ID resolution run in parallel
+        (postal_code, city), (make_id, model_id) = await asyncio.gather(
+            _reverse_geocode(lat, lon),
+            _resolve_ids(make, model),
+        )
+        postal_code = postal_code or DEFAULT_POSTAL_CODE
+    else:
+        postal_code = (extras.postal_code or DEFAULT_POSTAL_CODE).upper().replace(" ", "")
+        # Geocode and ID resolution run in parallel
+        (lat, lon, city), (make_id, model_id) = await asyncio.gather(
+            _geocode(postal_code),
+            _resolve_ids(make, model),
+        )
+
     province_abbr = _PROVINCE_ABBR.get(postal_code[0] if postal_code else "M", "ON")
 
-    # Geocode and taxonomy lookup run in parallel
-    (lat, lon, city), cat = await asyncio.gather(
-        _geocode(postal_code),
-        _resolve_cat(make, model),
-    )
+    # Build structured Vehicle_ input
+    classification: dict = {}
+    if make_id is not None:
+        classification["make"] = make_id
+    if model_id is not None:
+        classification["model"] = model_id
 
-    # Overfetch when year filters are active — T10 promoted listings bypass the server-side
-    # yr= filter, so we request more and trim after client-side year filtering.
-    fetch_size = min(per_page * 4, 100) if (year_min or year_max) else per_page
-    qs = _build_qs(cat, year_min, year_max, lat, lon, postal_code, city, province_abbr, page, fetch_size)
+    vehicle: dict = {
+        "vehicleType": [], "bodyColor": [], "bodyType": [], "equipment": [],
+        "fuel": [], "transmissionType": [], "interiorColor": [],
+        "offerType": [], "paintType": [], "upholstery": [],
+        "damagedListing": "Exclude",
+    }
+    if classification:
+        vehicle["classification"] = classification
+    if year_min or year_max:
+        vehicle["modelYear"] = {"from": year_min or 1900, "to": year_max or 9999}
+    if extras.odometer_max_km:
+        vehicle["mileageInKm"] = {"to": extras.odometer_max_km}
+
+    vars_ = {
+        "locale": "en_CA",
+        "vehicle": vehicle,
+        "location": {
+            "country": "Canada",
+            "zip": postal_code,
+            "position": {"latitude": lat, "longitude": lon},
+            "radius": 100,
+        },
+        "metadata": {
+            "sort": {"field": "Standard", "order": "Asc"},
+            "page": page,
+            "size": per_page,
+        },
+    }
 
     async with AsyncSession(impersonate="chrome131") as session:
-        resp = await _do_gql(session, qs, _cached_auth)
+        resp = await _do_structured(session, vars_, _cached_auth)
         if resp.status_code in (401, 403):
             _cached_auth = await _refresh_auth()
-            resp = await _do_gql(session, qs, _cached_auth)
+            resp = await _do_structured(session, vars_, _cached_auth)
         resp.raise_for_status()
 
     data = resp.json()
     if "errors" in data and not data.get("data"):
         raise ValueError(f"Autotrader GraphQL error: {data['errors'][0]['message']}")
 
-    r = data["data"]["search"]["listingsByQueryString"]
+    r = data["data"]["search"]["listings"]
     meta = r["metadata"]
 
     vehicles = []
@@ -290,20 +379,13 @@ async def search_inventory(
         cond = v.get("condition") or {}
         engine = v.get("engine") or {}
 
-        year = clf.get("modelYear")
-        # Client-side year filter: T10 promoted listings bypass the server-side yr= parameter
-        if year_min and year and year < year_min:
-            continue
-        if year_max and year and year > year_max:
-            continue
-
         odometer_raw = (cond.get("mileageInKm") or {}).get("raw")
         price_raw = (((d.get("prices") or {}).get("public") or {}).get("amountInEUR") or {}).get("raw")
         fuel = (((v.get("fuels") or {}).get("primary") or {}).get("type") or {}).get("formatted")
         loc = d.get("location") or {}
 
         vehicles.append({
-            "year": year,
+            "year": clf.get("modelYear"),
             "make": (clf.get("make") or {}).get("formatted"),
             "model": (clf.get("model") or {}).get("formatted"),
             "trim": clf.get("modelVersionInput"),
@@ -330,5 +412,5 @@ async def search_inventory(
         "total": meta["totalItems"],
         "page": meta["currentPage"],
         "per_page": per_page,
-        "vehicles": vehicles[:per_page],
+        "vehicles": vehicles,
     }

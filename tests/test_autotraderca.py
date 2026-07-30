@@ -7,159 +7,129 @@ import datasources.autotraderca as atca
 from datasources.autotraderca import (
     AutotraderExtras,
     DEFAULT_POSTAL_CODE,
-    _build_qs,
-    _resolve_cat,
+    _resolve_ids,
     search_inventory,
 )
 
 
 # ---------------------------------------------------------------------------
-# _build_qs
+# _resolve_ids
 # ---------------------------------------------------------------------------
 
-def test_build_qs_cat_code():
-    qs = _build_qs("ma31gr200622", None, None, 43.6, -79.4, "M5H2N2", "Toronto", "ON", 1, 25)
-    assert "cat=ma31gr200622" in qs
-    assert "mmmv=" not in qs
+def _mock_taxonomy_response(cat: str):
+    mock = MagicMock()
+    mock.json.return_value = {
+        "data": {"getFreeTextTaxonomyV2": {"items": [{"cat": cat}]}}
+    }
+    return mock
 
 
-def test_build_qs_mmmv_string():
-    qs = _build_qs("31|||", None, None, 43.6, -79.4, "M5H2N2", "Toronto", "ON", 1, 25)
-    assert "mmmv=31%7C%7C%7C" in qs or "mmmv=31|||" in qs
-    assert "cat=" not in qs
-
-
-def test_build_qs_no_make():
-    qs = _build_qs(None, None, None, 43.6, -79.4, "M5H2N2", "Toronto", "ON", 1, 25)
-    assert "cat=" not in qs
-    assert "mmmv=" not in qs
-
-
-def test_build_qs_year_range():
-    qs = _build_qs(None, 2010, 2015, 43.6, -79.4, "M5H2N2", "Toronto", "ON", 1, 25)
-    assert "yr=2010-2015" in qs
-
-
-def test_build_qs_year_min_only():
-    qs = _build_qs(None, 2018, None, 43.6, -79.4, "M5H2N2", "Toronto", "ON", 1, 25)
-    assert "yr=2018-2018" in qs
-
-
-def test_build_qs_year_max_only():
-    qs = _build_qs(None, None, 2020, 43.6, -79.4, "M5H2N2", "Toronto", "ON", 1, 25)
-    assert "yr=1900-2020" in qs
-
-
-def test_build_qs_fixed_params():
-    qs = _build_qs(None, None, None, 48.43, -123.5, "V9C3M3", "Victoria", "BC", 2, 50)
-    assert "lat=48.430000" in qs
-    assert "lon=-123.500000" in qs
-    assert "zipr=100" in qs
-    assert "offer=U" in qs
-    assert "cy=CA" in qs
-    assert "damaged_listing=exclude" in qs
-    assert "atype=C" in qs
-    assert "pg=2" in qs
-    assert "size=50" in qs
-
-
-# ---------------------------------------------------------------------------
-# _resolve_cat
-# ---------------------------------------------------------------------------
-
-def _mock_graphql_response(cat: str):
-    mock_resp = MagicMock()
-    mock_resp.json.return_value = {
+def _mock_sample_response(model_raw: int):
+    mock = MagicMock()
+    mock.json.return_value = {
         "data": {
-            "getFreeTextTaxonomyV2": {
-                "items": [{"cat": cat, "displayName": "Honda Civic"}]
+            "search": {
+                "listingsByQueryString": {
+                    "listings": [{"details": {"vehicle": {"classification": {
+                        "model": {"raw": model_raw, "formatted": "Civic"}
+                    }}}}]
+                }
             }
         }
     }
-    return mock_resp
+    return mock
 
 
 @pytest.mark.asyncio
-async def test_resolve_cat_make_and_model():
-    """make+model returns the full cat code."""
-    atca._taxonomy_cache.clear()
-    mock_resp = _mock_graphql_response("ma31gr200622")
+async def test_resolve_ids_make_and_model():
+    """make+model returns (make_id, model_id) from two sequential calls."""
+    atca._id_cache.clear()
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
-    mock_session.post = AsyncMock(return_value=mock_resp)
+    mock_session.post = AsyncMock(side_effect=[
+        _mock_taxonomy_response("ma31gr200622"),
+        _mock_sample_response(1775),
+    ])
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        result = await _resolve_cat("Honda", "Civic")
+        make_id, model_id = await _resolve_ids("Honda", "Civic")
 
-    assert result == "ma31gr200622"
+    assert make_id == 31
+    assert model_id == 1775
 
 
 @pytest.mark.asyncio
-async def test_resolve_cat_make_only():
-    """make-only strips the model group and returns 'makeId|||'."""
-    atca._taxonomy_cache.clear()
-    mock_resp = _mock_graphql_response("ma31gr200622")
+async def test_resolve_ids_make_only():
+    """make-only returns (make_id, None) with a single taxonomy call."""
+    atca._id_cache.clear()
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
-    mock_session.post = AsyncMock(return_value=mock_resp)
+    mock_session.post = AsyncMock(return_value=_mock_taxonomy_response("ma31gr200622"))
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        result = await _resolve_cat("Honda", None)
+        make_id, model_id = await _resolve_ids("Honda", None)
 
-    assert result == "31|||"
-
-
-@pytest.mark.asyncio
-async def test_resolve_cat_no_make():
-    result = await _resolve_cat(None, None)
-    assert result is None
+    assert make_id == 31
+    assert model_id is None
+    assert mock_session.post.call_count == 1  # no sample call needed
 
 
 @pytest.mark.asyncio
-async def test_resolve_cat_caches_result():
-    atca._taxonomy_cache.clear()
-    mock_resp = _mock_graphql_response("ma31gr200622")
+async def test_resolve_ids_no_make():
+    make_id, model_id = await _resolve_ids(None, None)
+    assert make_id is None
+    assert model_id is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_ids_caches_result():
+    atca._id_cache.clear()
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
-    mock_session.post = AsyncMock(return_value=mock_resp)
+    mock_session.post = AsyncMock(side_effect=[
+        _mock_taxonomy_response("ma31gr200622"),
+        _mock_sample_response(1775),
+    ])
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        await _resolve_cat("Honda", "Civic")
-        await _resolve_cat("Honda", "Civic")
+        await _resolve_ids("Honda", "Civic")
+        result = await _resolve_ids("Honda", "Civic")  # should hit cache
 
-    assert mock_session.post.call_count == 1
+    assert mock_session.post.call_count == 2  # taxonomy + sample, not 4
+    assert result == (31, 1775)
 
 
 @pytest.mark.asyncio
-async def test_resolve_cat_network_error_returns_none():
-    atca._taxonomy_cache.clear()
+async def test_resolve_ids_network_error_returns_none():
+    atca._id_cache.clear()
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
     mock_session.post = AsyncMock(side_effect=Exception("connection error"))
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        result = await _resolve_cat("Honda", "Civic")
+        result = await _resolve_ids("Honda", "Civic")
 
-    assert result is None
+    assert result == (None, None)
 
 
 # ---------------------------------------------------------------------------
 # search_inventory — happy path and edge cases
 # ---------------------------------------------------------------------------
 
-def _gql_listing(year: int, price: float = 20000.0, odometer: int = 50000) -> dict:
+def _structured_listing(year: int, price: float = 20000.0, odometer: int = 50000,
+                         model_name: str = "Civic") -> dict:
     return {
-        "id": f"test-{year}",
+        "id": f"test-{year}-{odometer}",
         "details": {
             "webPage": f"https://www.autotrader.ca/offers/test-{year}",
             "vehicle": {
                 "classification": {
                     "make": {"formatted": "Honda"},
-                    "model": {"formatted": "Civic"},
+                    "model": {"formatted": model_name},
                     "modelVersionInput": "EX",
                     "modelYear": year,
                 },
@@ -179,16 +149,17 @@ def _gql_listing(year: int, price: float = 20000.0, odometer: int = 50000) -> di
     }
 
 
-def _gql_response(listings: list, total: int = None, page: int = 1, page_size: int = 25) -> dict:
+def _structured_response(listings: list, total: int = None, page: int = 1,
+                          page_size: int = 25) -> dict:
     return {
         "data": {
             "search": {
-                "listingsByQueryString": {
+                "listings": {
                     "metadata": {
                         "currentPage": page,
                         "pageSize": page_size,
                         "totalItems": total if total is not None else len(listings),
-                        "totalPages": 1,
+                        "totalPages": max(1, (total or len(listings)) // page_size),
                     },
                     "listings": listings,
                 }
@@ -197,53 +168,41 @@ def _gql_response(listings: list, total: int = None, page: int = 1, page_size: i
     }
 
 
-def _make_mock_session(post_response=None, get_response=None, status_code=200):
-    mock_resp = MagicMock()
-    mock_resp.status_code = status_code
-    mock_resp.raise_for_status = MagicMock()
-    if post_response is not None:
-        mock_resp.json.return_value = post_response
-
-    mock_session = AsyncMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-    mock_session.post = AsyncMock(return_value=mock_resp)
-    if get_response is not None:
-        get_mock = MagicMock()
-        get_mock.json.return_value = get_response
-        mock_session.get = AsyncMock(return_value=get_mock)
-    return mock_session
-
-
-@pytest.mark.asyncio
-async def test_search_inventory_basic_result():
-    atca._taxonomy_cache.clear()
-    atca._geocode_cache.clear()
-
-    gql_data = _gql_response([_gql_listing(2012), _gql_listing(2013)], total=2)
-
-    # geocode GET → nominatim result; taxonomy POST → cat; search POST → listings
+def _make_mock_session(nominatim_result=None, taxonomy_cat="ma31gr200622",
+                       sample_model_raw=1775, search_response=None, status_code=200):
     nominatim_resp = MagicMock()
-    nominatim_resp.json.return_value = [{"lat": "43.6488", "lon": "-79.3844", "address": {"city": "Toronto"}}]
+    nominatim_resp.json.return_value = nominatim_result or [
+        {"lat": "43.6488", "lon": "-79.3844", "address": {"city": "Toronto"}}
+    ]
 
-    taxonomy_resp = MagicMock()
-    taxonomy_resp.json.return_value = {
-        "data": {"getFreeTextTaxonomyV2": {"items": [{"cat": "ma31gr200622", "displayName": "Honda Civic"}]}}
-    }
+    taxonomy_resp = _mock_taxonomy_response(taxonomy_cat)
+    sample_resp = _mock_sample_response(sample_model_raw)
 
     search_resp = MagicMock()
-    search_resp.status_code = 200
+    search_resp.status_code = status_code
     search_resp.raise_for_status = MagicMock()
-    search_resp.json.return_value = gql_data
+    if search_response is not None:
+        search_resp.json.return_value = search_response
 
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
     mock_session.get = AsyncMock(return_value=nominatim_resp)
-    mock_session.post = AsyncMock(side_effect=[taxonomy_resp, search_resp])
+    mock_session.post = AsyncMock(side_effect=[taxonomy_resp, sample_resp, search_resp])
+    return mock_session
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_basic_result():
+    atca._id_cache.clear()
+    atca._geocode_cache.clear()
+
+    data = _structured_response([_structured_listing(2012), _structured_listing(2013)], total=2)
+    mock_session = _make_mock_session(search_response=data)
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        result = await search_inventory("Honda", "Civic", None, None, extras=AutotraderExtras(postal_code="M5H2N2"))
+        result = await search_inventory("Honda", "Civic", None, None,
+                                        extras=AutotraderExtras(postal_code="M5H2N2"))
 
     assert result["total"] == 2
     assert len(result["vehicles"]) == 2
@@ -254,98 +213,137 @@ async def test_search_inventory_basic_result():
 
 
 @pytest.mark.asyncio
-async def test_search_inventory_year_filter_drops_promoted():
-    """T10 promoted listings outside the year range are dropped client-side."""
-    atca._taxonomy_cache.clear()
+async def test_search_inventory_year_filter_server_side():
+    """With the structured API, year filtering is server-side — no client-side trimming."""
+    atca._id_cache.clear()
     atca._geocode_cache.clear()
 
-    listings = [
-        _gql_listing(2008),  # below year_min — drop
-        _gql_listing(2010),  # in range
-        _gql_listing(2013),  # in range
-        _gql_listing(2016),  # above year_max — drop
-    ]
-    gql_data = _gql_response(listings, total=4)
-
-    nominatim_resp = MagicMock()
-    nominatim_resp.json.return_value = [{"lat": "43.6488", "lon": "-79.3844", "address": {"city": "Toronto"}}]
-
-    taxonomy_resp = MagicMock()
-    taxonomy_resp.json.return_value = {
-        "data": {"getFreeTextTaxonomyV2": {"items": [{"cat": "ma31gr200622", "displayName": "Honda Civic"}]}}
-    }
-
-    search_resp = MagicMock()
-    search_resp.status_code = 200
-    search_resp.raise_for_status = MagicMock()
-    search_resp.json.return_value = gql_data
-
-    mock_session = AsyncMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-    mock_session.get = AsyncMock(return_value=nominatim_resp)
-    mock_session.post = AsyncMock(side_effect=[taxonomy_resp, search_resp])
+    listings = [_structured_listing(2010), _structured_listing(2013), _structured_listing(2015)]
+    data = _structured_response(listings, total=3)
+    mock_session = _make_mock_session(search_response=data)
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        result = await search_inventory("Honda", "Civic", 2010, 2015, extras=AutotraderExtras(postal_code="M5H2N2"))
+        result = await search_inventory("Honda", "Civic", 2010, 2015,
+                                        extras=AutotraderExtras(postal_code="M5H2N2"))
 
+    # All server-returned listings pass through unchanged
     years = [v["year"] for v in result["vehicles"]]
-    assert 2008 not in years
-    assert 2016 not in years
-    assert 2010 in years
-    assert 2013 in years
+    assert years == [2010, 2013, 2015]
 
 
 @pytest.mark.asyncio
-async def test_search_inventory_no_year_filter_keeps_all():
-    atca._taxonomy_cache.clear()
+async def test_search_inventory_odometer_filter():
+    """odometer_max_km in extras is sent as mileageInKm filter in the Vehicle_ input."""
+    atca._id_cache.clear()
     atca._geocode_cache.clear()
 
-    gql_data = _gql_response([_gql_listing(2010), _gql_listing(2020)], total=2)
+    listings = [_structured_listing(2012, odometer=120000)]
+    data = _structured_response(listings, total=1)
+    mock_session = _make_mock_session(search_response=data)
 
-    nominatim_resp = MagicMock()
-    nominatim_resp.json.return_value = [{"lat": "43.6488", "lon": "-79.3844", "address": {"city": "Toronto"}}]
+    with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
+        result = await search_inventory("Honda", "Civic", None, None,
+                                        extras=AutotraderExtras(postal_code="M5H2N2",
+                                                                odometer_max_km=150000))
 
-    taxonomy_resp = MagicMock()
-    taxonomy_resp.json.return_value = {
-        "data": {"getFreeTextTaxonomyV2": {"items": [{"cat": "ma31gr200622", "displayName": "Honda Civic"}]}}
-    }
+    assert len(result["vehicles"]) == 1
+    # Verify the structured search POST included mileageInKm
+    search_call = mock_session.post.call_args_list[-1]
+    body = search_call.kwargs["json"]
+    assert body["variables"]["vehicle"]["mileageInKm"] == {"to": 150000}
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_pagination():
+    """page and per_page are passed through to the structured API metadata."""
+    atca._id_cache.clear()
+    atca._geocode_cache.clear()
+
+    data = _structured_response([_structured_listing(2014)], total=50, page=2)
+    mock_session = _make_mock_session(search_response=data)
+
+    with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
+        result = await search_inventory("Honda", "Civic", None, None, page=2, per_page=10,
+                                        extras=AutotraderExtras(postal_code="M5H2N2"))
+
+    assert result["page"] == 2
+    search_call = mock_session.post.call_args_list[-1]
+    body = search_call.kwargs["json"]
+    assert body["variables"]["metadata"]["page"] == 2
+    assert body["variables"]["metadata"]["size"] == 10
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_lat_lon():
+    """latitude/longitude bypass postal-code geocoding and reverse-geocode instead."""
+    atca._id_cache.clear()
+    atca._geocode_cache.clear()
+    atca._reverse_geocode_cache.clear()
+
+    data = _structured_response([_structured_listing(2012)], total=1)
+
+    reverse_resp = MagicMock()
+    reverse_resp.json.return_value = {"address": {"postcode": "V6B 1A1", "city": "Vancouver"}}
+
+    taxonomy_resp = _mock_taxonomy_response("ma31gr200622")
+    sample_resp = _mock_sample_response(1775)
 
     search_resp = MagicMock()
     search_resp.status_code = 200
     search_resp.raise_for_status = MagicMock()
-    search_resp.json.return_value = gql_data
+    search_resp.json.return_value = data
 
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
-    mock_session.get = AsyncMock(return_value=nominatim_resp)
-    mock_session.post = AsyncMock(side_effect=[taxonomy_resp, search_resp])
+    mock_session.get = AsyncMock(return_value=reverse_resp)
+    mock_session.post = AsyncMock(side_effect=[taxonomy_resp, sample_resp, search_resp])
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        result = await search_inventory("Honda", "Civic", None, None, extras=AutotraderExtras(postal_code="M5H2N2"))
+        result = await search_inventory(
+            "Honda", "Civic", None, None,
+            extras=AutotraderExtras(latitude=49.2827, longitude=-123.1207),
+        )
 
-    assert len(result["vehicles"]) == 2
+    assert len(result["vehicles"]) == 1
+    # Reverse geocoding hit Nominatim's reverse endpoint with the given coordinates
+    reverse_call = mock_session.get.call_args
+    assert reverse_call.kwargs["params"]["lat"] == "49.2827"
+    assert reverse_call.kwargs["params"]["lon"] == "-123.1207"
+    # The resolved postal code / lat-lon are forwarded to the structured search
+    search_call = mock_session.post.call_args_list[-1]
+    body = search_call.kwargs["json"]
+    assert body["variables"]["location"]["position"] == {"latitude": 49.2827, "longitude": -123.1207}
+    assert body["variables"]["location"]["zip"] == "V6B1A1"
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_lat_without_lon_raises():
+    atca._id_cache.clear()
+    atca._geocode_cache.clear()
+
+    with pytest.raises(ValueError):
+        await search_inventory("Honda", "Civic", None, None,
+                                extras=AutotraderExtras(latitude=49.2827))
 
 
 @pytest.mark.asyncio
 async def test_search_inventory_auth_refresh_on_403():
     """On a 403, auth is refreshed and the request retried."""
-    atca._taxonomy_cache.clear()
+    atca._id_cache.clear()
     atca._geocode_cache.clear()
     atca._cached_auth = "Basic oldtoken=="
 
-    gql_data = _gql_response([_gql_listing(2012)], total=1)
+    data = _structured_response([_structured_listing(2012)], total=1)
 
     nominatim_resp = MagicMock()
-    nominatim_resp.json.return_value = [{"lat": "43.6488", "lon": "-79.3844", "address": {"city": "Toronto"}}]
+    nominatim_resp.json.return_value = [
+        {"lat": "43.6488", "lon": "-79.3844", "address": {"city": "Toronto"}}
+    ]
 
-    taxonomy_resp = MagicMock()
-    taxonomy_resp.json.return_value = {
-        "data": {"getFreeTextTaxonomyV2": {"items": [{"cat": "ma31gr200622", "displayName": "Honda Civic"}]}}
-    }
+    taxonomy_resp = _mock_taxonomy_response("ma31gr200622")
+    sample_resp = _mock_sample_response(1775)
 
-    # First search POST → 403; second → 200
     search_resp_403 = MagicMock()
     search_resp_403.status_code = 403
     search_resp_403.raise_for_status = MagicMock()
@@ -353,9 +351,8 @@ async def test_search_inventory_auth_refresh_on_403():
     search_resp_ok = MagicMock()
     search_resp_ok.status_code = 200
     search_resp_ok.raise_for_status = MagicMock()
-    search_resp_ok.json.return_value = gql_data
+    search_resp_ok.json.return_value = data
 
-    # Homepage GET for auth refresh
     homepage_resp = MagicMock()
     homepage_resp.text = '"/_next/static/chunks/main-abc123.js"'
 
@@ -365,13 +362,16 @@ async def test_search_inventory_auth_refresh_on_403():
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
-    # GET calls: nominatim, homepage, chunk
+    # GET order: nominatim, homepage, chunk
     mock_session.get = AsyncMock(side_effect=[nominatim_resp, homepage_resp, chunk_resp])
-    # POST calls: taxonomy, first search (403), second search (200 after refresh)
-    mock_session.post = AsyncMock(side_effect=[taxonomy_resp, search_resp_403, search_resp_ok])
+    # POST order: taxonomy, sample, first search (403), second search (200)
+    mock_session.post = AsyncMock(
+        side_effect=[taxonomy_resp, sample_resp, search_resp_403, search_resp_ok]
+    )
 
     with patch("datasources.autotraderca.AsyncSession", return_value=mock_session):
-        result = await search_inventory("Honda", "Civic", None, None, extras=AutotraderExtras(postal_code="M5H2N2"))
+        result = await search_inventory("Honda", "Civic", None, None,
+                                        extras=AutotraderExtras(postal_code="M5H2N2"))
 
     assert len(result["vehicles"]) == 1
     assert atca._cached_auth == f"Basic {atca._AUTH_B64_PREFIX}NewTokenHere="
