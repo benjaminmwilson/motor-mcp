@@ -1,14 +1,23 @@
 """sm360 datasource — shared inventory API behind many Canadian dealer sites.
 
 sm360 (part of 360.Agency) powers dealer websites for many independent
-Canadian dealers, keyed by organizationId/organizationUnitId. Different
-dealer sites use different front-end templates (some call the inventory API
-directly from the browser, others proxy it through a first-party route), but
-the underlying API at service.vehicles.sm360.ca is identical for all of
-them. New dealers can be added to REGISTRY without writing new code: load
-the dealer's used-inventory page and search its HTML for
-`"organizationId":<id>,"organizationUnitId":<id>` (and `addressLocality`/
-`addressRegion` for city/province).
+Canadian dealers, keyed by organizationId/organizationUnitId. Sites are
+sm360-powered if their footer reads "Powered and developed by 360.Agency /
+SM360", or if their page HTML contains `organizationId`/`organizationUnitId`
+or `img.sm360.ca` asset URLs.
+
+Two front-end templates exist, controlled by Dealer.api_mode:
+  - "direct": the browser calls service.vehicles.sm360.ca directly with
+    organizationId/organizationUnitId in the query string. Both IDs are
+    visible in the page HTML JSON (`"organizationId":<id>,
+    "organizationUnitId":<id>`), alongside `addressLocality`/`addressRegion`
+    for city/province.
+  - "proxy": the browser only calls a first-party
+    `/en/used-inventory/api/listing` route on the dealer's own domain,
+    which proxies to sm360 server-side. Only organizationUnitId is exposed
+    client-side (e.g. in the cherry.sm360.ca analytics beacon or a hidden
+    form field) — organizationId is never visible, but isn't needed since
+    the dealer's own proxy route can be called directly instead.
 """
 
 from dataclasses import dataclass, field
@@ -21,10 +30,11 @@ from curl_cffi.requests import AsyncSession
 class Dealer:
     name: str
     base_url: str
-    organization_id: int
-    organization_unit_id: int
     city: str
     province: str
+    organization_id: Optional[int] = None
+    organization_unit_id: Optional[int] = None
+    api_mode: str = "direct"  # "direct" or "proxy" — see module docstring
 
 
 REGISTRY: dict[str, Dealer] = {
@@ -59,6 +69,14 @@ REGISTRY: dict[str, Dealer] = {
         organization_unit_id=8,
         city="Sherbrooke",
         province="QC",
+    ),
+    "vidrives": Dealer(
+        name="VI Drives",
+        base_url="https://www.vidrives.ca",
+        city="Nanaimo",
+        province="BC",
+        organization_unit_id=9336,
+        api_mode="proxy",
     ),
 }
 
@@ -101,6 +119,60 @@ def _build_payload(text_search: str, page_number: int, page_size: int) -> dict:
     }
 
 
+async def _fetch_direct(client: AsyncSession, dealer: "Dealer", text_search: str) -> list[dict]:
+    api_url = API_URL_TEMPLATE.format(
+        province=dealer.province,
+        organization_id=dealer.organization_id,
+        organization_unit_id=dealer.organization_unit_id,
+    )
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": f"{dealer.base_url}/en/used-inventory",
+    }
+    vehicles: list[dict] = []
+    page_number = 1
+    while True:
+        payload = _build_payload(text_search, page_number, MAX_PAGE_SIZE)
+        resp = await client.post(api_url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        vehicles.extend(data.get("inventoryVehicles", []))
+        num_pages = data.get("pagination", {}).get("numberOfPages", 1)
+        if page_number >= num_pages:
+            break
+        page_number += 1
+    return vehicles
+
+
+async def _fetch_proxy(client: AsyncSession, dealer: "Dealer") -> list[dict]:
+    """Fetch via the dealer's own first-party proxy route.
+
+    This route has no server-side text search, so make/model filtering
+    happens client-side after fetching (see search_inventory).
+    """
+    listing_url = f"{dealer.base_url}/en/used-inventory/api/listing"
+    headers = {"Accept": "application/json", "Referer": f"{dealer.base_url}/en/used-inventory"}
+    vehicles: list[dict] = []
+    page_number = 1
+    while True:
+        params = {
+            "imageSize": "w600h450c",
+            "limit": MAX_PAGE_SIZE,
+            "page": page_number,
+            "namedSorting": "featuredASC",
+        }
+        resp = await client.get(listing_url, params=params, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        vehicles.extend(data.get("vehicles", []))
+        num_pages = data.get("pagination", {}).get("numberOfPages", 1)
+        if page_number >= num_pages:
+            break
+        page_number += 1
+    return vehicles
+
+
 def _build_vdp_url(base_url: str, v: dict) -> Optional[str]:
     make_slug = (v.get("make") or {}).get("slug")
     model_slug = (v.get("model") or {}).get("slug")
@@ -130,34 +202,28 @@ async def search_inventory(
         )
     dealer = REGISTRY[extras.dealer]
 
-    api_url = API_URL_TEMPLATE.format(
-        province=dealer.province,
-        organization_id=dealer.organization_id,
-        organization_unit_id=dealer.organization_unit_id,
-    )
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Referer": f"{dealer.base_url}/en/used-inventory",
-    }
-
-    # The API has no year filter; the free-text search covers make/model and
-    # a single dealer's inventory is cheap to page through in full.
+    # The direct API has no year filter; the free-text search covers
+    # make/model and a single dealer's inventory is cheap to page through
+    # in full.
     text_search = " ".join(part for part in (make, model) if part)
 
-    all_vehicles: list[dict] = []
     async with AsyncSession(impersonate="chrome131") as client:
-        page_number = 1
-        while True:
-            payload = _build_payload(text_search, page_number, MAX_PAGE_SIZE)
-            resp = await client.post(api_url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            all_vehicles.extend(data.get("inventoryVehicles", []))
-            num_pages = data.get("pagination", {}).get("numberOfPages", 1)
-            if page_number >= num_pages:
-                break
-            page_number += 1
+        if dealer.api_mode == "proxy":
+            all_vehicles = await _fetch_proxy(client, dealer)
+            # The proxy route has no server-side text search either, so
+            # make/model filtering happens client-side here instead.
+            if make:
+                all_vehicles = [
+                    v for v in all_vehicles
+                    if make.lower() in ((v.get("make") or {}).get("name") or "").lower()
+                ]
+            if model:
+                all_vehicles = [
+                    v for v in all_vehicles
+                    if model.lower() in ((v.get("model") or {}).get("name") or "").lower()
+                ]
+        else:
+            all_vehicles = await _fetch_direct(client, dealer, text_search)
 
     if year_min:
         all_vehicles = [v for v in all_vehicles if (v.get("year") or 0) >= year_min]

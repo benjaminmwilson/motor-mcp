@@ -50,6 +50,27 @@ def _mock_session(*responses):
     return mock_session
 
 
+def _mock_proxy_response(vehicles: list, page_number: int = 1, number_of_pages: int = 1):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "pagination": {
+            "pageNumber": page_number, "pageSize": 100,
+            "numberOfPages": number_of_pages, "numberOfItems": len(vehicles),
+        },
+        "vehicles": vehicles,
+    }
+    return resp
+
+
+def _mock_proxy_session(*responses):
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session.get = AsyncMock(side_effect=list(responses))
+    return mock_session
+
+
 @pytest.mark.asyncio
 async def test_search_inventory_basic_result():
     vehicles = [_inventory_vehicle(1, 2018), _inventory_vehicle(2, 2020)]
@@ -146,3 +167,53 @@ async def test_search_inventory_client_side_pagination():
     assert result["total"] == 5
     assert len(result["vehicles"]) == 2
     assert result["vehicles"][0]["vin"] == "VIN3"
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_proxy_dealer_basic_result():
+    vehicles = [_inventory_vehicle(1, 2018)]
+    mock_session = _mock_proxy_session(_mock_proxy_response(vehicles))
+
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        result = await search_inventory(None, None, None, None, extras=SM360Extras(dealer="vidrives"))
+
+    assert mock_session.get.call_count == 1
+    assert mock_session.post.await_count == 0
+    call = mock_session.get.call_args_list[0]
+    assert call.args[0] == "https://www.vidrives.ca/en/used-inventory/api/listing"
+    v = result["vehicles"][0]
+    assert v["city"] == "Nanaimo"
+    assert v["province"] == "BC"
+    assert v["dealer"] == "VI Drives"
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_proxy_dealer_client_side_make_filter():
+    """The proxy route has no server-side text search, so make/model filtering happens client-side."""
+    vehicles = [
+        _inventory_vehicle(1, 2018, make="Honda", model="Civic"),
+        _inventory_vehicle(2, 2019, make="Toyota", model="Corolla"),
+    ]
+    mock_session = _mock_proxy_session(_mock_proxy_response(vehicles))
+
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        result = await search_inventory("Toyota", None, None, None, extras=SM360Extras(dealer="vidrives"))
+
+    assert result["total"] == 1
+    assert result["vehicles"][0]["make"] == "Toyota"
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_proxy_dealer_paginates_across_api_pages():
+    page1 = [_inventory_vehicle(i, 2018) for i in range(1, 101)]
+    page2 = [_inventory_vehicle(101, 2019)]
+    mock_session = _mock_proxy_session(
+        _mock_proxy_response(page1, page_number=1, number_of_pages=2),
+        _mock_proxy_response(page2, page_number=2, number_of_pages=2),
+    )
+
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        result = await search_inventory(None, None, None, None, page=1, per_page=200, extras=SM360Extras(dealer="vidrives"))
+
+    assert mock_session.get.call_count == 2
+    assert result["total"] == 101
