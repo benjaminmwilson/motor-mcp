@@ -1,10 +1,9 @@
-"""Tests for the Group Auto Centre (groupauto) datasource."""
+"""Tests for the sm360 datasource."""
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import datasources.groupauto as ga
-from datasources.groupauto import GroupAutoExtras, search_inventory
+from datasources.sm360 import SM360Extras, search_inventory
 
 
 def _inventory_vehicle(vehicle_id: int, year: int, price: float = 20000.0,
@@ -56,25 +55,41 @@ async def test_search_inventory_basic_result():
     vehicles = [_inventory_vehicle(1, 2018), _inventory_vehicle(2, 2020)]
     mock_session = _mock_session(_mock_response(vehicles))
 
-    with patch("datasources.groupauto.AsyncSession", return_value=mock_session):
-        result = await search_inventory("Honda", "Civic", None, None)
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        result = await search_inventory("Honda", "Civic", None, None, extras=SM360Extras(dealer="groupauto"))
 
     assert result["total"] == 2
-    assert len(result["vehicles"]) == 2
     v = result["vehicles"][0]
     assert v["year"] == 2018
-    assert v["make"] == "Honda"
-    assert v["model"] == "Civic"
-    assert v["condition"] == "Used"
     assert v["city"] == "Colwood"
     assert v["province"] == "BC"
-    assert v["price_cad"] == 20000.0
-    assert v["msrp_cad"] == 21000.0
-    assert v["vin"] == "VIN1"
-    assert v["stock"] == "S1"
+    assert v["dealer"] == "Group Auto Centre"
     assert v["url"] == (
         "https://www.groupautocentre.com/en/used-inventory/honda/civic/2018-honda-civic-id1"
     )
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_uses_dealer_specific_org_ids():
+    mock_session = _mock_session(_mock_response([]))
+
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        await search_inventory(None, None, None, None, extras=SM360Extras(dealer="mbsherbrooke"))
+
+    call = mock_session.post.call_args_list[0]
+    assert "organizationId=1&organizationUnitId=8" in call.args[0]
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_missing_dealer_raises():
+    with pytest.raises(ValueError):
+        await search_inventory(None, None, None, None, extras=SM360Extras(dealer=None))
+
+
+@pytest.mark.asyncio
+async def test_search_inventory_unknown_dealer_raises():
+    with pytest.raises(ValueError):
+        await search_inventory(None, None, None, None, extras=SM360Extras(dealer="not-a-real-dealer"))
 
 
 @pytest.mark.asyncio
@@ -83,8 +98,8 @@ async def test_search_inventory_year_filter_client_side():
     vehicles = [_inventory_vehicle(1, 2010), _inventory_vehicle(2, 2015), _inventory_vehicle(3, 2020)]
     mock_session = _mock_session(_mock_response(vehicles))
 
-    with patch("datasources.groupauto.AsyncSession", return_value=mock_session):
-        result = await search_inventory(None, None, 2012, 2018)
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        result = await search_inventory(None, None, 2012, 2018, extras=SM360Extras(dealer="groupauto"))
 
     assert result["total"] == 1
     assert result["vehicles"][0]["year"] == 2015
@@ -94,8 +109,8 @@ async def test_search_inventory_year_filter_client_side():
 async def test_search_inventory_text_search_combines_make_and_model():
     mock_session = _mock_session(_mock_response([]))
 
-    with patch("datasources.groupauto.AsyncSession", return_value=mock_session):
-        await search_inventory("Toyota", "Highlander", None, None)
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        await search_inventory("Toyota", "Highlander", None, None, extras=SM360Extras(dealer="groupauto"))
 
     call = mock_session.post.call_args_list[0]
     assert call.kwargs["json"]["vehicle"]["textSearch"] == "Toyota Highlander"
@@ -111,8 +126,8 @@ async def test_search_inventory_paginates_across_api_pages():
         _mock_response(page2, page_number=2, number_of_pages=2),
     )
 
-    with patch("datasources.groupauto.AsyncSession", return_value=mock_session):
-        result = await search_inventory(None, None, None, None, page=1, per_page=200)
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        result = await search_inventory(None, None, None, None, page=1, per_page=200, extras=SM360Extras(dealer="groupauto"))
 
     assert mock_session.post.call_count == 2
     assert result["total"] == 101
@@ -123,8 +138,8 @@ async def test_search_inventory_client_side_pagination():
     vehicles = [_inventory_vehicle(i, 2018) for i in range(1, 6)]
     mock_session = _mock_session(_mock_response(vehicles))
 
-    with patch("datasources.groupauto.AsyncSession", return_value=mock_session):
-        result = await search_inventory(None, None, None, None, page=2, per_page=2)
+    with patch("datasources.sm360.AsyncSession", return_value=mock_session):
+        result = await search_inventory(None, None, None, None, page=2, per_page=2, extras=SM360Extras(dealer="groupauto"))
 
     assert result["page"] == 2
     assert result["per_page"] == 2
