@@ -180,7 +180,7 @@ async def test_search_inventory_proxy_dealer_basic_result():
     assert mock_session.get.call_count == 1
     assert mock_session.post.await_count == 0
     call = mock_session.get.call_args_list[0]
-    assert call.args[0] == "https://www.vidrives.ca/en/used-inventory/api/listing"
+    assert call.args[0] == "https://www.nanaimomitsubishi.ca/en/used-inventory/api/listing"
     v = result["vehicles"][0]
     assert v["city"] == "Nanaimo"
     assert v["province"] == "BC"

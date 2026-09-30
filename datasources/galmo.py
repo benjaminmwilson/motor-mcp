@@ -56,7 +56,13 @@ async def search_inventory(
     per_page: int = 25,
     extras: GalmoExtras = GalmoExtras(),
 ) -> dict:
-    url = build_api_url(make, model, year_min, year_max, page, per_page)
+    # The VMS API's "md" filter requires an exact match against its internal model
+    # names (e.g. "Civic Coupe" / "Civic Sedan", never plain "Civic"), so passing
+    # a model straight through would silently match nothing. Fetch by make/year
+    # only and filter by model as a case-insensitive substring client-side instead.
+    fetch_per_page = 100 if model else per_page
+    fetch_page = 1 if model else page
+    url = build_api_url(make, None, year_min, year_max, fetch_page, fetch_per_page)
     async with AsyncSession(impersonate="chrome131") as client:
         # Visit SRP first to pick up session cookies before the AJAX call
         await client.get("https://www.galaxymotors.net/vehicles/")
@@ -64,8 +70,15 @@ async def search_inventory(
         resp.raise_for_status()
 
     data = resp.json()
-    total = data.get("summary", {}).get("total_vehicles", 0)
     results = data.get("results", [])
+
+    if model:
+        results = [v for v in results if model.lower() in (v.get("model") or "").lower()]
+        total = len(results)
+        start = (page - 1) * per_page
+        results = results[start:start + per_page]
+    else:
+        total = data.get("summary", {}).get("total_vehicles", 0)
 
     vehicles = []
     for v in results:

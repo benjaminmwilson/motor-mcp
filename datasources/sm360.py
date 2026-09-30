@@ -72,7 +72,8 @@ REGISTRY: dict[str, Dealer] = {
     ),
     "vidrives": Dealer(
         name="VI Drives",
-        base_url="https://www.vidrives.ca",
+        # vidrives.ca now redirects here — the dealer rebranded to Nanaimo Mitsubishi.
+        base_url="https://www.nanaimomitsubishi.ca",
         city="Nanaimo",
         province="BC",
         organization_unit_id=9336,
