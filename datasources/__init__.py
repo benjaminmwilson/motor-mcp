@@ -3,9 +3,10 @@ import typing
 from dataclasses import dataclass
 from typing import Callable
 
-from datasources import autotraderca, galmo, sm360
+from datasources import autotraderca, galmo, harrisvictoria, sm360
 from datasources.autotraderca import AutotraderExtras
 from datasources.galmo import GalmoExtras
+from datasources.harrisvictoria import HarrisVictoriaExtras
 from datasources.sm360 import SM360Extras
 
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
@@ -53,5 +54,11 @@ DATASOURCES: dict[str, Datasource] = {
         long_name="SM360 Dealer Network",
         search=sm360.search_inventory,
         extras_type=SM360Extras,
+    ),
+    "harrisvictoria": Datasource(
+        short_name="harrisvictoria",
+        long_name="Harris Victoria Chrysler Dodge Jeep Ram",
+        search=harrisvictoria.search_inventory,
+        extras_type=HarrisVictoriaExtras,
     ),
 }
